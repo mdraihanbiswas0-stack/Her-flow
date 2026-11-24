@@ -1,0 +1,942 @@
+# ইয়ার-ফ্লো (EarFlow) — একটি ফাইলেই পুরো অ্যাপ
+# ব্যবহার: GitHub repo-তে এই ফাইলটি .github/workflows/build.yml নামে রাখুন।
+# commit করলেই অটো APK বিল্ড শুরু হবে। Actions ট্যাব > Artifacts থেকে APK নামান।
+name: Build EarFlow APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create EarFlow project files
+        run: |
+          set -e
+          mkdir -p earflow_project
+          mkdir -p earflow_project/app
+          mkdir -p earflow_project/app/src/main
+          mkdir -p earflow_project/app/src/main/java/com/earflow/app
+          mkdir -p earflow_project/app/src/main/res/drawable
+          mkdir -p earflow_project/app/src/main/res/mipmap-anydpi-v26
+          mkdir -p earflow_project/app/src/main/res/values
+          mkdir -p earflow_project/app/src/main/res/xml
+          cat > earflow_project/app/build.gradle <<'EFEOF'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+              namespace 'com.earflow.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.earflow.app"
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.core:core-ktx:1.12.0'
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/AndroidManifest.xml <<'EFEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+              <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+              <uses-permission android:name="android.permission.PROCESS_OUTGOING_CALLS"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+
+              <application android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".EditorActivity" android:exported="false"/>
+
+                  <receiver android:name=".CallReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.PHONE_STATE"/>
+                          <action android:name="android.intent.action.NEW_OUTGOING_CALL"/>
+                      </intent-filter>
+                  </receiver>
+
+                  <service android:name=".CallRecordService" android:exported="false"
+                      android:foregroundServiceType="microphone"/>
+                  <service android:name=".ScreenRecordService" android:exported="false"
+                      android:foregroundServiceType="mediaProjection|microphone"/>
+
+                  <service android:name=".EarFlowAccessibilityService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/CallReceiver.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.content.*
+          import android.telephony.TelephonyManager
+          import androidx.core.content.ContextCompat
+
+          class CallReceiver : BroadcastReceiver() {
+              companion object {
+                  private var lastState = TelephonyManager.CALL_STATE_IDLE
+                  private var incoming = false
+                  private var number = ""
+                  private var recording = false
+              }
+
+              private fun send(ctx: Context, act: String) {
+                  try {
+                      ContextCompat.startForegroundService(ctx, Intent(ctx, CallRecordService::class.java).apply {
+                          action = act
+                          putExtra("number", number)
+                          putExtra("incoming", incoming)
+                      })
+                  } catch (_: Exception) {}
+              }
+
+              override fun onReceive(ctx: Context, intent: Intent) {
+                  if (!ctx.getSharedPreferences("ef", Context.MODE_PRIVATE).getBoolean("auto", false)) return
+                  if (intent.action == Intent.ACTION_NEW_OUTGOING_CALL) {
+                      number = intent.getStringExtra(Intent.EXTRA_PHONE_NUMBER) ?: ""
+                      incoming = false
+                      return
+                  }
+                  val st = when (intent.getStringExtra(TelephonyManager.EXTRA_STATE)) {
+                      TelephonyManager.EXTRA_STATE_RINGING -> TelephonyManager.CALL_STATE_RINGING
+                      TelephonyManager.EXTRA_STATE_OFFHOOK -> TelephonyManager.CALL_STATE_OFFHOOK
+                      else -> TelephonyManager.CALL_STATE_IDLE
+                  }
+                  @Suppress("DEPRECATION")
+                  val num = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
+                  if (st == TelephonyManager.CALL_STATE_RINGING) {
+                      incoming = true
+                      if (!num.isNullOrEmpty()) number = num
+                  }
+                  if (st == lastState) return
+
+                  when (st) {
+                      TelephonyManager.CALL_STATE_OFFHOOK -> {
+                          if (lastState != TelephonyManager.CALL_STATE_RINGING) incoming = false
+                          if (!recording) { recording = true; send(ctx, "START") }
+                      }
+                      TelephonyManager.CALL_STATE_IDLE -> {
+                          if (recording) { recording = false; send(ctx, "STOP") }
+                          number = ""
+                      }
+                  }
+                  lastState = st
+              }
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/CallRecordService.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.app.*
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.content.Intent
+          import android.media.*
+          import android.media.audiofx.AutomaticGainControl
+          import android.net.Uri
+          import android.os.*
+          import android.provider.CallLog
+          import android.provider.ContactsContract
+          import androidx.core.app.NotificationCompat
+          import java.io.File
+          import java.io.RandomAccessFile
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import kotlin.math.abs
+
+          class CallRecordService : Service() {
+              @Volatile private var running = false
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startFg()
+                  when (intent?.action) {
+                      "START" -> startRec(intent.getStringExtra("number") ?: "", intent.getBooleanExtra("incoming", true))
+                      "STOP" -> running = false
+                      "QUIT" -> { running = false; stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+                  }
+                  return START_STICKY
+              }
+
+              private fun startFg() {
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("call", "Call recorder", NotificationManager.IMPORTANCE_LOW))
+                  val n = NotificationCompat.Builder(this, "call")
+                      .setContentTitle("ইয়ার-ফ্লো: অটো কল রেকর্ড চালু")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now).setOngoing(true).build()
+                  if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  else startForeground(1, n)
+              }
+
+              private fun clean(s: String) = s.replace(Regex("[^\\p{L}\\p{N}+ ]"), "_")
+
+              private fun fileName(name: String, num: String, incoming: Boolean, time: String) =
+                  "${clean(name)}_${clean(num.ifEmpty { "NoNumber" })}_${if (incoming) "IN" else "OUT"}_$time.wav"
+
+              private fun startRec(numberIn: String, incoming: Boolean) {
+                  if (running) return
+                  running = true
+                  val p = getSharedPreferences("ef", MODE_PRIVATE)
+                  val maxGain = p.getInt("gain", 12).toFloat()
+                  val audio = getSystemService(AudioManager::class.java)
+                  val oldSpeaker = audio.isSpeakerphoneOn
+                  val oldVol = audio.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+
+                  // অপর প্রান্তের আওয়াজ মাইকে ধরতে: স্পিকার অন + ভলিউম ম্যাক্স
+                  if (p.getBoolean("speaker", true)) {
+                      @Suppress("DEPRECATION")
+                      audio.isSpeakerphoneOn = true
+                      audio.setStreamVolume(AudioManager.STREAM_VOICE_CALL,
+                          audio.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL), 0)
+                  }
+
+                  val time = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                  val dir = File(getExternalFilesDir(null), "calls").apply { mkdirs() }
+                  val name = contactName(numberIn) ?: "Unknown"
+                  val file = File(dir, fileName(name, numberIn, incoming, time))
+
+                  Thread {
+                      val rate = 16000
+                      val bufSize = maxOf(AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT), rate * 2)
+                      var rec: AudioRecord? = null
+                      for (src in intArrayOf(MediaRecorder.AudioSource.VOICE_CALL, MediaRecorder.AudioSource.UNPROCESSED,
+                          MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
+                          try {
+                              val r = AudioRecord(src, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize)
+                              if (r.state == AudioRecord.STATE_INITIALIZED) { rec = r; break } else r.release()
+                          } catch (_: Exception) {}
+                      }
+                      var total = 0L
+                      try {
+                          if (rec != null) {
+                              if (AutomaticGainControl.isAvailable())
+                                  AutomaticGainControl.create(rec.audioSessionId)?.enabled = true
+                              val raf = RandomAccessFile(file, "rw")
+                              raf.setLength(0); raf.write(ByteArray(44))
+                              val buf = ShortArray(bufSize / 2)
+                              var gain = 1f
+                              rec.startRecording()
+                              while (running) {
+                                  val n = rec.read(buf, 0, buf.size)
+                                  if (n <= 0) continue
+                                  var peak = 1
+                                  for (i in 0 until n) { val a = abs(buf[i].toInt()); if (a > peak) peak = a }
+                                  // কম আওয়াজ হলে অটো গেইন বাড়ে, জোরে হলে সঙ্গে সঙ্গে কমে
+                                  if (peak > 40) {
+                                      val target = (26000f / peak).coerceIn(1f, maxGain)
+                                      gain = if (target < gain) target else gain + (target - gain) * 0.15f
+                                  }
+                                  val out = ByteArray(n * 2)
+                                  for (i in 0 until n) {
+                                      val v = (buf[i] * gain).toInt().coerceIn(-32768, 32767)
+                                      out[2 * i] = (v and 0xff).toByte()
+                                      out[2 * i + 1] = ((v shr 8) and 0xff).toByte()
+                                  }
+                                  raf.write(out); total += out.size
+                              }
+                              try { rec.stop() } catch (_: Exception) {}
+                              rec.release()
+                              val b = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+                              b.put("RIFF".toByteArray()); b.putInt((36 + total).toInt()); b.put("WAVE".toByteArray())
+                              b.put("fmt ".toByteArray()); b.putInt(16); b.putShort(1); b.putShort(1)
+                              b.putInt(rate); b.putInt(rate * 2); b.putShort(2); b.putShort(16)
+                              b.put("data".toByteArray()); b.putInt(total.toInt())
+                              raf.seek(0); raf.write(b.array()); raf.close()
+                          }
+                      } finally {
+                          running = false
+                          @Suppress("DEPRECATION")
+                          audio.isSpeakerphoneOn = oldSpeaker
+                          audio.setStreamVolume(AudioManager.STREAM_VOICE_CALL, oldVol, 0)
+                          // নম্বর না পেলে কল লগ থেকে নিয়ে ফাইলের নাম ঠিক করা
+                          main.postDelayed({ fixName(file, numberIn, incoming, time) }, 2500)
+                      }
+                  }.start()
+              }
+
+              private fun fixName(file: File, numberIn: String, incoming: Boolean, time: String) {
+                  if (numberIn.isNotEmpty() || !file.exists()) return
+                  try {
+                      contentResolver.query(CallLog.Calls.CONTENT_URI,
+                          arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME), null, null, "date DESC")?.use {
+                          if (it.moveToFirst()) {
+                              val num = it.getString(0) ?: return
+                              val name = it.getString(1) ?: contactName(num) ?: "Unknown"
+                              file.renameTo(File(file.parentFile, fileName(name, num, incoming, time)))
+                          }
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun contactName(number: String): String? {
+                  if (number.isEmpty()) return null
+                  return try {
+                      val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number))
+                      contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)
+                          ?.use { if (it.moveToFirst()) it.getString(0) else null }
+                  } catch (_: Exception) { null }
+              }
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/EarFlowAccessibilityService.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.view.accessibility.AccessibilityEvent
+
+          // কলের সময় কিছু ফোনে মাইক্রোফোন অ্যাক্সেস পেতে এই সার্ভিস চালু থাকা দরকার
+          class EarFlowAccessibilityService : AccessibilityService() {
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/EditorActivity.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.content.ContentValues
+          import android.media.*
+          import android.os.*
+          import android.provider.MediaStore
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import java.io.File
+          import java.nio.ByteBuffer
+          import kotlin.math.max
+
+          class EditorActivity : AppCompatActivity() {
+              private lateinit var path: String
+              private lateinit var video: VideoView
+              private var dur = 0
+              private var startMs = 0
+              private var endMs = 0
+              private val h = Handler(Looper.getMainLooper())
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  title = "ভিডিও এডিটর"
+                  path = intent.getStringExtra("path")!!
+                  MediaMetadataRetriever().also {
+                      it.setDataSource(path)
+                      dur = it.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)!!.toInt(); it.release()
+                  }
+                  endMs = dur
+
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 24, 24, 24) }
+                  video = VideoView(this).apply { setVideoPath(path); seekTo(1) }
+                  root.addView(video, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
+                  val info = TextView(this)
+                  fun upd() { info.text = "শুরু: ${startMs / 1000.0}s   শেষ: ${endMs / 1000.0}s   (মোট ${dur / 1000.0}s)" }
+                  upd()
+                  root.addView(info)
+
+                  fun seek(label: String, init: Int, onCh: (Int) -> Unit): SeekBar {
+                      root.addView(TextView(this).apply { text = label })
+                      return SeekBar(this).apply {
+                          max = dur; progress = init
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(sb: SeekBar?, p: Int, user: Boolean) { if (user) { onCh(p); upd() } }
+                              override fun onStartTrackingTouch(sb: SeekBar?) {}
+                              override fun onStopTrackingTouch(sb: SeekBar?) {}
+                          })
+                          root.addView(this)
+                      }
+                  }
+                  seek("শুরু", 0) { startMs = minOf(it, endMs - 100); video.seekTo(startMs) }
+                  seek("শেষ", dur) { endMs = max(it, startMs + 100) }
+
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() }; root.addView(this) }
+                  btn("▶ নির্বাচিত অংশ প্লে") {
+                      video.seekTo(startMs); video.start()
+                      val chk = object : Runnable {
+                          override fun run() {
+                              if (video.currentPosition >= endMs) video.pause() else if (video.isPlaying) h.postDelayed(this, 50)
+                          }
+                      }
+                      h.postDelayed(chk, 100)
+                  }
+                  btn("✂ ট্রিম করে নতুন ভিডিও সেভ") {
+                      val dst = File(File(path).parentFile, "EarFlow_trim_${System.currentTimeMillis()}.mp4")
+                      Toast.makeText(this, "সেভ হচ্ছে...", Toast.LENGTH_SHORT).show()
+                      Thread {
+                          try { trim(path, dst.absolutePath, startMs * 1000L, endMs * 1000L)
+                              runOnUiThread { Toast.makeText(this, "সেভ হয়েছে: ${dst.name}", Toast.LENGTH_LONG).show() }
+                          } catch (e: Exception) { runOnUiThread { Toast.makeText(this, "ব্যর্থ: ${e.message}", Toast.LENGTH_LONG).show() } }
+                      }.start()
+                  }
+                  btn("📥 গ্যালারিতে সেভ") { toGallery() }
+                  setContentView(root)
+              }
+
+              // রি-এনকোড ছাড়া ট্রিম (দ্রুত, কোয়ালিটি লস নেই); শুরু সবচেয়ে কাছের কী-ফ্রেমে যায়
+              private fun trim(src: String, dst: String, startUs: Long, endUs: Long) {
+                  val ex = MediaExtractor().apply { setDataSource(src) }
+                  val mux = MediaMuxer(dst, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                  val map = HashMap<Int, Int>()
+                  var maxBuf = 1 shl 20
+                  for (i in 0 until ex.trackCount) {
+                      val f = ex.getTrackFormat(i)
+                      val m = f.getString(MediaFormat.KEY_MIME) ?: continue
+                      if (m.startsWith("video/") || m.startsWith("audio/")) {
+                          ex.selectTrack(i); map[i] = mux.addTrack(f)
+                          if (f.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) maxBuf = max(maxBuf, f.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                      }
+                  }
+                  mux.start()
+                  ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                  val buf = ByteBuffer.allocate(maxBuf)
+                  val info = MediaCodec.BufferInfo()
+                  var base = -1L
+                  while (true) {
+                      info.size = ex.readSampleData(buf, 0)
+                      if (info.size < 0) break
+                      val t = ex.sampleTime
+                      if (t > endUs) break
+                      if (base < 0) base = t
+                      info.presentationTimeUs = max(0L, t - base)
+                      info.flags = ex.sampleFlags
+                      info.offset = 0
+                      mux.writeSampleData(map[ex.sampleTrackIndex]!!, buf, info)
+                      ex.advance()
+                  }
+                  mux.stop(); mux.release(); ex.release()
+              }
+
+              private fun toGallery() {
+                  val f = File(path)
+                  val v = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, f.name)
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/EarFlow")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v)
+                  if (uri != null) {
+                      contentResolver.openOutputStream(uri)?.use { o -> f.inputStream().use { it.copyTo(o) } }
+                      Toast.makeText(this, "গ্যালারি > Movies/EarFlow এ সেভ হয়েছে", Toast.LENGTH_LONG).show()
+                  }
+              }
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/MainActivity.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.media.MediaPlayer
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.view.View
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import java.io.File
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var prefs: android.content.SharedPreferences
+              private lateinit var list: ListView
+              private var tab = 0
+              private var files = listOf<File>()
+              private var player: MediaPlayer? = null
+
+              private val projLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  if (r.resultCode == RESULT_OK && r.data != null) {
+                      ContextCompat.startForegroundService(this, Intent(this, ScreenRecordService::class.java).apply {
+                          action = "START"; putExtra("code", r.resultCode); putExtra("data", r.data)
+                      })
+                      moveTaskToBack(true)
+                  }
+              }
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  prefs = getSharedPreferences("ef", Context.MODE_PRIVATE)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(12)) }
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }
+
+                  root.addView(TextView(this).apply { text = "ইয়ার-ফ্লো"; textSize = 26f })
+                  root.addView(Switch(this).apply {
+                      text = "অটো কল রেকর্ড"
+                      isChecked = prefs.getBoolean("auto", false)
+                      setOnCheckedChangeListener { _, on ->
+                          prefs.edit().putBoolean("auto", on).apply()
+                          val i = Intent(this@MainActivity, CallRecordService::class.java).setAction(if (on) "IDLE" else "QUIT")
+                          ContextCompat.startForegroundService(this@MainActivity, i)
+                      }
+                  })
+                  root.addView(btn("পারমিশন সেটআপ") { setupDialog() })
+                  root.addView(btn("🔴 স্ক্রিন রেকর্ড শুরু") { startScreen() })
+                  root.addView(btn("⚙ সেটিংস") { settingsDialog() })
+
+                  val tabs = LinearLayout(this)
+                  tabs.addView(btn("কল রেকর্ডিং") { tab = 0; refresh() }, LinearLayout.LayoutParams(0, -2, 1f))
+                  tabs.addView(btn("ভিডিও") { tab = 1; refresh() }, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(tabs)
+
+                  list = ListView(this)
+                  root.addView(list, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+
+                  if (prefs.getBoolean("auto", false))
+                      ContextCompat.startForegroundService(this, Intent(this, CallRecordService::class.java).setAction("IDLE"))
+
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      val f = files[pos]
+                      if (tab == 1) startActivity(Intent(this, EditorActivity::class.java).putExtra("path", f.absolutePath))
+                      else { player?.release(); player = MediaPlayer().apply { setDataSource(f.absolutePath); prepare(); start() } }
+                  }
+                  list.setOnItemLongClickListener { _, _, pos, _ ->
+                      AlertDialog.Builder(this).setMessage("মুছে ফেলবেন?")
+                          .setPositiveButton("হ্যাঁ") { _, _ -> files[pos].delete(); refresh() }
+                          .setNegativeButton("না", null).show()
+                      true
+                  }
+              }
+
+              override fun onResume() { super.onResume(); refresh() }
+              override fun onDestroy() { player?.release(); super.onDestroy() }
+
+              private fun refresh() {
+                  val dir = File(getExternalFilesDir(null), if (tab == 0) "calls" else "videos")
+                  files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
+                  list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1,
+                      files.map { it.nameWithoutExtension.replace("_", "  ") })
+              }
+
+              private fun startScreen() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "আগে ওভারলে পারমিশন দিন", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      return
+                  }
+                  ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS), 2)
+                  projLauncher.launch((getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager).createScreenCaptureIntent())
+              }
+
+              private fun setupDialog() {
+                  val items = arrayOf("১. রানটাইম পারমিশন (ফোন, কল লগ, মাইক, কন্টাক্ট)", "২. ওভারলে (ভাসমান বিন্দু)",
+                      "৩. ব্যাটারি অপটিমাইজেশন বন্ধ", "৪. অ্যাক্সেসিবিলিটি চালু (কলে মাইকের জন্য)")
+                  AlertDialog.Builder(this).setTitle("সব ধাপ করুন").setItems(items) { _, i ->
+                      when (i) {
+                          0 -> ActivityCompat.requestPermissions(this, arrayOf(
+                              Manifest.permission.READ_PHONE_STATE, Manifest.permission.READ_CALL_LOG,
+                              Manifest.permission.PROCESS_OUTGOING_CALLS, Manifest.permission.RECORD_AUDIO,
+                              Manifest.permission.READ_CONTACTS, Manifest.permission.POST_NOTIFICATIONS), 1)
+                          1 -> startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                          2 -> if (!(getSystemService(POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName))
+                              startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                          3 -> startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }.show()
+              }
+
+              private fun settingsDialog() {
+                  val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(10), dp(20), dp(10)) }
+                  fun spin(label: String, names: List<String>, vals: List<Int>, key: String, def: Int) {
+                      box.addView(TextView(this).apply { text = label })
+                      box.addView(Spinner(this).apply {
+                          adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names)
+                          setSelection(vals.indexOf(prefs.getInt(key, def)).coerceAtLeast(0))
+                          onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                              override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                                  prefs.edit().putInt(key, vals[pos]).apply()
+                              }
+                              override fun onNothingSelected(p: AdapterView<*>?) {}
+                          }
+                      })
+                  }
+                  fun chk(label: String, key: String, def: Boolean) = box.addView(CheckBox(this).apply {
+                      text = label; isChecked = prefs.getBoolean(key, def)
+                      setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean(key, on).apply() }
+                  })
+                  box.addView(TextView(this).apply { text = "— স্ক্রিন রেকর্ড —"; textSize = 16f })
+                  spin("রেজোলিউশন", listOf("720p", "1080p", "ফোনের নেটিভ"), listOf(720, 1080, 0), "quality", 1080)
+                  spin("FPS", listOf("30", "60"), listOf(30, 60), "fps", 60)
+                  spin("বিটরেট", listOf("8 Mbps", "16 Mbps", "24 Mbps"), listOf(8, 16, 24), "bitrate", 16)
+                  chk("মাইক্রোফোন (ভয়েস) রেকর্ড", "mic", true)
+                  chk("৩-২-১ কাউন্টডাউন", "countdown", true)
+                  chk("ভাসমান ইশারা-বিন্দু দেখান", "dot", true)
+                  spin("বিন্দুর রঙ", listOf("লাল", "হলুদ", "সবুজ"), listOf(0, 1, 2), "dotColor", 0)
+                  box.addView(TextView(this).apply { text = "— কল রেকর্ড —"; textSize = 16f; setPadding(0, dp(12), 0, 0) })
+                  chk("কলে অটো স্পিকার + ফুল ভলিউম", "speaker", true)
+                  spin("সাউন্ড বুস্ট (সর্বোচ্চ)", listOf("৪x", "৮x", "১২x", "২০x"), listOf(4, 8, 12, 20), "gain", 12)
+                  AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(box) })
+                      .setPositiveButton("ঠিক আছে", null).show()
+              }
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/PointerView.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.view.View
+
+          // টিউটোরিয়ালে ইশারা করার ভাসমান বিন্দু। ধরে টানলে সরে, ট্যাপ করলে রিং-পালস হয়।
+          class PointerView(c: Context, private val size: Int, color: Int) : View(c) {
+              private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color; alpha = 210 }
+              private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE; strokeWidth = 7f; this.color = color
+              }
+              private var pulse = 0f
+
+              override fun onDraw(c: Canvas) {
+                  val cx = width / 2f; val cy = height / 2f; val r = size * 0.22f
+                  c.drawCircle(cx, cy, r, dot)
+                  if (pulse > 0f) {
+                      ring.alpha = ((1 - pulse) * 255).toInt()
+                      c.drawCircle(cx, cy, r + size * 0.28f * pulse, ring)
+                  }
+              }
+
+              fun pulse() {
+                  ValueAnimator.ofFloat(0f, 1f).apply {
+                      duration = 500
+                      addUpdateListener { pulse = it.animatedValue as Float; invalidate() }
+                      start()
+                  }
+              }
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/java/com/earflow/app/ScreenRecordService.kt <<'EFEOF'
+          package com.earflow.app
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.MediaRecorder
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.provider.Settings
+          import android.util.DisplayMetrics
+          import android.view.*
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.IntentCompat
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import kotlin.math.abs
+          import kotlin.math.min
+
+          class ScreenRecordService : Service() {
+              private var projection: MediaProjection? = null
+              private var vd: VirtualDisplay? = null
+              private var recorder: MediaRecorder? = null
+              private var pointer: PointerView? = null
+              private var countView: TextView? = null
+              private var paused = false
+              private var active = false
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  when (intent?.action) {
+                      "START" -> {
+                          fg()
+                          val code = intent.getIntExtra("code", 0)
+                          val data = IntentCompat.getParcelableExtra(intent, "data", Intent::class.java)
+                          if (data == null) { stopSelf(); return START_NOT_STICKY }
+                          val p = getSharedPreferences("ef", MODE_PRIVATE)
+                          if (p.getBoolean("countdown", true) && Settings.canDrawOverlays(this)) countdown(3) { capture(code, data) }
+                          else capture(code, data)
+                      }
+                      "PAUSE" -> togglePause()
+                      "STOP" -> stopAll()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun pi(action: String) = PendingIntent.getService(this, action.hashCode(),
+                  Intent(this, ScreenRecordService::class.java).setAction(action), PendingIntent.FLAG_IMMUTABLE)
+
+              private fun notif(): Notification {
+                  return NotificationCompat.Builder(this, "scr")
+                      .setContentTitle(if (paused) "রেকর্ডিং বিরতিতে" else "স্ক্রিন রেকর্ড হচ্ছে")
+                      .setSmallIcon(android.R.drawable.ic_media_play).setOngoing(true)
+                      .addAction(0, if (paused) "চালু" else "বিরতি", pi("PAUSE"))
+                      .addAction(0, "বন্ধ", pi("STOP")).build()
+              }
+
+              private fun fg() {
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("scr", "Screen recorder", NotificationManager.IMPORTANCE_LOW))
+                  var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                  if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                      type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                  startForeground(2, notif(), type)
+              }
+
+              private fun overlay(w: Int, hh: Int, touchable: Boolean) = WindowManager.LayoutParams(
+                  w, hh, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                      (if (touchable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+                  PixelFormat.TRANSLUCENT).apply { gravity = if (touchable) Gravity.TOP or Gravity.START else Gravity.CENTER }
+
+              private fun countdown(n: Int, done: () -> Unit) {
+                  if (countView == null) {
+                      val tv = TextView(this).apply { textSize = 96f; setTextColor(Color.WHITE); setShadowLayer(12f, 0f, 0f, Color.BLACK) }
+                      countView = tv
+                      wm.addView(tv, overlay(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, false))
+                  }
+                  if (n == 0) {
+                      countView?.let { wm.removeView(it) }
+                      countView = null
+                      h.postDelayed({ done() }, 150)
+                      return
+                  }
+                  countView?.text = n.toString()
+                  h.postDelayed({ countdown(n - 1, done) }, 1000)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun capture(code: Int, data: Intent) {
+                  val p = getSharedPreferences("ef", MODE_PRIVATE)
+                  val dm = DisplayMetrics().also { wm.defaultDisplay.getRealMetrics(it) }
+                  val q = p.getInt("quality", 1080)
+                  val scale = if (q == 0) 1f else min(1f, q.toFloat() / min(dm.widthPixels, dm.heightPixels))
+                  val w = (dm.widthPixels * scale).toInt() / 2 * 2
+                  val hh = (dm.heightPixels * scale).toInt() / 2 * 2
+                  val mic = p.getBoolean("mic", true) &&
+                      checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+                  val dir = File(getExternalFilesDir(null), "videos").apply { mkdirs() }
+                  val f = File(dir, "EarFlow_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4")
+
+                  try {
+                      recorder = MediaRecorder().apply {
+                          if (mic) setAudioSource(MediaRecorder.AudioSource.MIC)
+                          setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                          setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                          setOutputFile(f.absolutePath)
+                          setVideoEncoder(MediaRecorder.VideoEncoder.H264)   // হার্ডওয়্যার এনকোডার = ল্যাগ-ফ্রি
+                          setVideoSize(w, hh)
+                          setVideoFrameRate(p.getInt("fps", 60))
+                          setVideoEncodingBitRate(p.getInt("bitrate", 16) * 1_000_000)
+                          if (mic) {
+                              setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                              setAudioEncodingBitRate(128000); setAudioSamplingRate(44100)
+                          }
+                          prepare()
+                      }
+                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      projection = mpm.getMediaProjection(code, data).apply {
+                          registerCallback(object : MediaProjection.Callback() {
+                              override fun onStop() { stopAll() }
+                          }, h)
+                      }
+                      vd = projection!!.createVirtualDisplay("EarFlow", w, hh, dm.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, recorder!!.surface, null, h)
+                      recorder!!.start()
+                      active = true
+                      if (p.getBoolean("dot", true) && Settings.canDrawOverlays(this)) showPointer(p.getInt("dotColor", 0))
+                  } catch (e: Exception) { stopAll() }
+              }
+
+              private fun showPointer(colorIdx: Int) {
+                  val size = (96 * resources.displayMetrics.density).toInt()
+                  val color = intArrayOf(0xFFFF1744.toInt(), 0xFFFFEA00.toInt(), 0xFF00E676.toInt())[colorIdx.coerceIn(0, 2)]
+                  val v = PointerView(this, size, color)
+                  val lp = overlay(size, size, true).apply { x = 200; y = 600 }
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
+                              if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                              lp.x = sx + dx; lp.y = sy + dy
+                              wm.updateViewLayout(v, lp)
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) v.pulse()
+                      }
+                      true
+                  }
+                  wm.addView(v, lp)
+                  pointer = v
+              }
+
+              private fun togglePause() {
+                  try {
+                      if (paused) recorder?.resume() else recorder?.pause()
+                      paused = !paused
+                      getSystemService(NotificationManager::class.java).notify(2, notif())
+                  } catch (_: Exception) {}
+              }
+
+              private fun stopAll() {
+                  if (!active && recorder == null && countView == null) { stopSelf(); return }
+                  active = false
+                  h.removeCallbacksAndMessages(null)
+                  try { recorder?.stop() } catch (_: Exception) {}
+                  try { recorder?.release() } catch (_: Exception) {}
+                  recorder = null
+                  vd?.release(); vd = null
+                  try { projection?.stop() } catch (_: Exception) {}
+                  projection = null
+                  pointer?.let { try { wm.removeView(it) } catch (_: Exception) {} }; pointer = null
+                  countView?.let { try { wm.removeView(it) } catch (_: Exception) {} }; countView = null
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onDestroy() { if (active) stopAll(); super.onDestroy() }
+          }
+          EFEOF
+          cat > earflow_project/app/src/main/res/drawable/ic_launcher_background.xml <<'EFEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:pathData="M0,0h108v108h-108z">
+                  <aapt:attr name="android:fillColor">
+                      <gradient android:type="linear" android:startX="0" android:startY="0"
+                          android:endX="108" android:endY="108">
+                          <item android:offset="0.0" android:color="#FF5B2EFF"/>
+                          <item android:offset="0.5" android:color="#FFE040FB"/>
+                          <item android:offset="1.0" android:color="#FFFF7A00"/>
+                      </gradient>
+                  </aapt:attr>
+              </path>
+          </vector>
+          EFEOF
+          cat > earflow_project/app/src/main/res/drawable/ic_launcher_foreground.xml <<'EFEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <!-- বাইরের ঢেউ (সায়ান) -->
+              <path android:pathData="M77,34.7 A30,30 0 0 1 77,73.3"
+                  android:strokeColor="#FF00E5FF" android:strokeWidth="5" android:strokeLineCap="round"/>
+              <path android:pathData="M31,34.7 A30,30 0 0 0 31,73.3"
+                  android:strokeColor="#FF00E5FF" android:strokeWidth="5" android:strokeLineCap="round"/>
+              <!-- ভেতরের ঢেউ (হলুদ) -->
+              <path android:pathData="M69.3,41.1 A20,20 0 0 1 69.3,66.9"
+                  android:strokeColor="#FFFFEA00" android:strokeWidth="5" android:strokeLineCap="round"/>
+              <path android:pathData="M38.7,41.1 A20,20 0 0 0 38.7,66.9"
+                  android:strokeColor="#FFFFEA00" android:strokeWidth="5" android:strokeLineCap="round"/>
+              <!-- মাঝখানে রেকর্ড-ডট -->
+              <path android:pathData="M42,54 a12,12 0 1,0 24,0 a12,12 0 1,0 -24,0"
+                  android:fillColor="#FFFFFFFF"/>
+              <path android:pathData="M46,54 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0"
+                  android:fillColor="#FFFF1744"/>
+          </vector>
+          EFEOF
+          cat > earflow_project/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EFEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background"/>
+              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          EFEOF
+          cat > earflow_project/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml <<'EFEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background"/>
+              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          EFEOF
+          cat > earflow_project/app/src/main/res/values/strings.xml <<'EFEOF'
+          <resources>
+              <string name="app_name">ইয়ার-ফ্লো</string>
+              <string name="acc_desc">কলের সময় মাইক্রোফোন অ্যাক্সেস পেতে ইয়ার-ফ্লোর জন্য এটি চালু রাখুন।</string>
+          </resources>
+          EFEOF
+          cat > earflow_project/app/src/main/res/xml/accessibility_config.xml <<'EFEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="false"
+              android:description="@string/acc_desc" />
+          EFEOF
+          cat > earflow_project/build.gradle <<'EFEOF'
+          plugins {
+              id 'com.android.application' version '8.2.0' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EFEOF
+          cat > earflow_project/gradle.properties <<'EFEOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EFEOF
+          cat > earflow_project/settings.gradle <<'EFEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "EarFlow"
+          include ':app'
+          EFEOF
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Build debug APK
+        working-directory: earflow_project
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EarFlow-APK
+          path: earflow_project/app/build/outputs/apk/debug/app-debug.apk
